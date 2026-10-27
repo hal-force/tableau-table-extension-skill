@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Secrets -- never commit
+.env
+.env.*
+secrets.json
+*.pem
+*.key
+*.secret
+pwd.txt
+
+# Tableau artifacts (may contain data or credentials)
+*.twb
+*.twbx
+*.tds
+*.tdsx
+*.hyper
+
+# Per-run output (previews hold API data)
+out/
+preview.csv
+schema.json
+result_meta.json
+/tmp/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# More credential / keystore formats
+*.p12
+*.pfx
+*.jks
+*.keystore
+.netrc
+_netrc
+.tableau-tabext/
+
+# Logs and scratch (TabPy logs the full script and can log data)
+*.log
+tabpy_log.log*
+*.tmp
+
+# Other Tableau / data artifacts
+*.tfl
+*.tflx
+*.csv
+
+# Local agent settings
+.claude/settings.local.json

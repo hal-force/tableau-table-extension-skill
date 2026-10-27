@@ -1,0 +1,17 @@
+# Authoring / local testing (the author's machine)
+requests>=2.32.4         # 2.32.4 fixes CVE-2024-47081 (.netrc leak) and CVE-2024-35195 (verify=False reuse)
+pandas>=1.5              # run_local.py DataFrame + Arrow-path emulation, tests
+simplejson>=3.17         # TabPy's JSON transport (ignore_nan=True), emulated exactly
+pyarrow>=14.0.1          # TabPy's Arrow transport check; 14.0.1 fixes CVE-2023-47248
+tabpy>=2.9               # optional: a real local TabPy for run_local.py --tabpy / tests --tabpy
+                         # (tested with tabpy 2.16.0, pandas 3.1, pyarrow 26, requests 2.34, Python 3.11-3.13)
+
+# Optional
+# keyring>=24            # OS keystore on Windows / Linux (macOS uses the Keychain CLI)
+
+# TabPy host (install into the Python that runs TabPy, not necessarily here)
+#   requests>=2.32.4     every REST / GraphQL connector (same CVE floor as above)
+#   sqlalchemy + driver  --kind sql (psycopg2, pyodbc, oracledb, snowflake-sqlalchemy, ...)
+#   keyring              optional keystore lookups on non-macOS hosts
+#   openpyxl / defusedxml  only if a connector reads Excel / XML
+#   Python 3.8+          the runtime and scaffolds stay 3.8-syntax (check_script --py)

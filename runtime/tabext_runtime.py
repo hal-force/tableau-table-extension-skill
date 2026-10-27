@@ -1,0 +1,600 @@
+# ==== BEGIN TABEXT RUNTIME v3 (tableau-table-extension skill - do not edit; refresh with new_connector.py --refresh-runtime) ====
+# Runs inside TabPy's  def _user_script(tabpy, _arg1...):  wrapper, so every
+# name below is a local of that function. Python 3.8+ syntax only, spaces only.
+# Needs on the TabPy host: requests (HTTP connectors). Optional: keyring.
+# Reads these CONFIG names from the section above: TIME_BUDGET_S,
+# CONNECT_TIMEOUT_S, READ_TIMEOUT_S, RETRIES, CA_BUNDLE, CLIENT_CERT,
+# CLIENT_KEY, MAX_ROWS, ON_BAD_VALUE.
+import base64 as _b64
+import datetime as _dt
+import decimal as _decimal
+import email.utils as _eut
+import ipaddress as _ip
+import json as _json
+import math as _math
+import os as _os
+import re as _re
+import subprocess as _sp
+import sys as _sys
+import time as _time
+from urllib.parse import quote as _quote, quote_plus as _quote_plus, urljoin as _urljoin, urlsplit as _urlsplit
+
+_T0 = _time.monotonic()
+_STATE = {"secrets": [], "redact": [], "cache": {}, "session": None, "bad": {}, "tokens": {}}
+_INPUT = locals().get("_arg1")
+
+
+def budget_left():
+    """Seconds left before TIME_BUDGET_S (keep it under TabPy's TABPY_EVALUATE_TIMEOUT)."""
+    return TIME_BUDGET_S - (_time.monotonic() - _T0)
+
+
+def check_budget(what="the connector"):
+    if budget_left() <= 0:
+        raise RuntimeError(
+            "tabext: %s exceeded TIME_BUDGET_S=%ss. Narrow the query (date range, "
+            "filters, page size) or raise TIME_BUDGET_S together with TabPy's "
+            "TABPY_EVALUATE_TIMEOUT." % (what, TIME_BUDGET_S))
+
+
+def remember_secret(s):
+    """Register a value (e.g. a session token from a login call) so redact() hides it
+    and http_request() treats requests carrying it as credentialed. Also covers its
+    URL-quoted, JSON-escaped and base64 (standard / urlsafe, padded or not) forms."""
+    s = "" if s is None else str(s)
+    if len(s) < 4 or s in _STATE["secrets"]:
+        return
+    _STATE["secrets"].append(s)
+    b = s.encode("utf-8")
+    forms = {s, _quote(s, safe=""), _quote_plus(s), _json.dumps(s)[1:-1]}
+    for enc in (_b64.b64encode(b).decode("ascii"), _b64.urlsafe_b64encode(b).decode("ascii")):
+        forms |= {enc, enc.rstrip("=")}
+    _STATE["redact"] = sorted(set(_STATE["redact"]) | {f for f in forms if len(f) >= 4},
+                              key=len, reverse=True)
+
+
+_remember_secret = remember_secret
+_QUERY_IN_TEXT = _re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://[^\s?#'\"<>]*)\?[^\s'\"<>]*")
+
+
+def _strip_query(text):
+    """Drop query strings from any URL inside a message (they often carry keys)."""
+    return _QUERY_IN_TEXT.sub(lambda m: m.group(1) + "?<query removed>", str(text))
+
+
+def redact(text):
+    """Remove every secret this run resolved (and its URL/base64 forms) from a string."""
+    text = "" if text is None else str(text)
+    for s in _STATE["redact"]:
+        if s in text:
+            text = text.replace(s, "<redacted>")
+    return text
+
+
+def get_secret(name, required=True, redact=True):
+    """Resolve a secret ON THE TABPY HOST - never from the workbook.
+
+    Order: env TABLEAU_TABEXT_<NAME> -> macOS Keychain (service
+    'tableau-tabext', account NAME) -> python keyring -> JSON file
+    $TABLEAU_TABEXT_SECRETS_FILE or ~/.tableau-tabext/secrets.json.
+    Resolved once per run (cached). redact=False for identities that aren't
+    secret (a username, an OAuth client id): otherwise every occurrence of them
+    in error messages AND in the output data is replaced with <redacted>.
+    """
+    if name in _STATE["cache"]:
+        return _STATE["cache"][name]
+    env = "TABLEAU_TABEXT_" + "".join(c if c.isalnum() else "_" for c in name).upper()
+
+    def _dec(v):
+        v = (v or "").strip()
+        if v.startswith("b64:"):
+            try:
+                return _b64.b64decode(v[4:]).decode("utf-8").strip()
+            except Exception:
+                return ""
+        return v
+
+    v = _dec(_os.environ.get(env, ""))
+    if not v and _sys.platform == "darwin" and _os.path.exists("/usr/bin/security"):
+        try:
+            r = _sp.run(["/usr/bin/security", "find-generic-password", "-s", "tableau-tabext",
+                         "-a", name, "-w"], capture_output=True, text=True,
+                        timeout=max(1.0, min(15.0, budget_left())))
+            if r.returncode == 0:
+                v = _dec(r.stdout)
+        except Exception:
+            pass
+    if not v:
+        try:
+            import keyring
+            v = _dec(keyring.get_password("tableau-tabext", name))
+        except Exception:
+            pass
+    if not v:
+        p = (_os.environ.get("TABLEAU_TABEXT_SECRETS_FILE")
+             or _os.path.expanduser("~/.tableau-tabext/secrets.json"))
+        try:
+            with open(p) as fh:
+                raw = _json.load(fh).get(name, "") or ""
+                v = _dec(raw if isinstance(raw, str) else _json.dumps(raw))
+        except Exception:
+            pass
+    if v:
+        if redact:
+            _remember_secret(v)
+        _STATE["cache"][name] = v
+    elif required:
+        raise RuntimeError(
+            "tabext: secret '%s' not found on the TabPy host. On that host run: "
+            "python3 set_secret.py %s   (or give the TabPy process env var %s)" % (name, name, env))
+    return v
+
+
+def same_origin(a, b):
+    """True if two URLs have the same scheme, host and port (exact match, no prefix tricks)."""
+    try:
+        x, y = _urlsplit(str(a)), _urlsplit(str(b))
+        dp = {"http": 80, "https": 443}
+        return (x.scheme.lower() == y.scheme.lower() and (x.hostname or "") == (y.hostname or "")
+                and (x.port or dp.get(x.scheme.lower())) == (y.port or dp.get(y.scheme.lower()))
+                and x.username is None and y.username is None)
+    except ValueError:
+        return False
+
+
+def _session():
+    if _STATE["session"] is None:
+        import logging
+        import requests
+        # TabPy's default logging config runs urllib3 at DEBUG, which writes every
+        # request URL - including query-string API keys - to the TabPy log.
+        for _lg in ("urllib3", "urllib3.connectionpool"):
+            logging.getLogger(_lg).setLevel(logging.WARNING)
+        s = requests.Session()
+        s.headers["User-Agent"] = "tableau-table-extension/3"
+        # trust_env off: no ~/.netrc credentials attached behind our back, and no env
+        # CA bundle silently overriding CA_BUNDLE. Proxies and the host's
+        # REQUESTS_CA_BUNDLE are applied explicitly per request in http_request().
+        s.trust_env = False
+        verify = True
+        if CA_BUNDLE:
+            verify = _os.path.expanduser(CA_BUNDLE)
+            if not _os.path.exists(verify):
+                raise RuntimeError("tabext: CA_BUNDLE %s does not exist on the TabPy host" % verify)
+        else:
+            env_ca = _os.environ.get("REQUESTS_CA_BUNDLE") or _os.environ.get("CURL_CA_BUNDLE")
+            if env_ca and _os.path.exists(env_ca):
+                verify = env_ca
+        cert = None
+        if CLIENT_CERT:
+            c = _os.path.expanduser(CLIENT_CERT)
+            k = _os.path.expanduser(CLIENT_KEY) if CLIENT_KEY else None
+            for f in [c] + ([k] if k else []):
+                if not _os.path.exists(f):
+                    raise RuntimeError("tabext: client certificate file %s not found on the TabPy host" % f)
+            cert = (c, k) if k else c
+        _STATE["tls"] = (verify, cert)
+        _STATE["session"] = s
+    return _STATE["session"]
+
+
+def _where(url):
+    """scheme://host/path only: no query string, fragment or user:pass, secrets redacted."""
+    try:
+        u = _urlsplit(str(url))
+        host = u.hostname or ""
+        if u.port:
+            host += ":%d" % u.port
+        return redact("%s://%s%s" % (u.scheme, host, u.path) if u.scheme else u.path)
+    except ValueError:
+        return "<unparseable url>"
+
+
+def _carries_secret(*parts):
+    blob = redact(_json.dumps([str(p) for p in parts]))
+    return "<redacted>" in blob
+
+
+def _is_loopback(url):
+    h = (_urlsplit(str(url)).hostname or "").lower()
+    if h == "localhost":
+        return True
+    try:
+        return _ip.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
+_CRED_HEADER = _re.compile(r"(?i)^(?:authorization|proxy-authorization|cookie)$|key|token|secret|auth|signature|session")
+
+
+def _retry_after(value):
+    """Seconds from a Retry-After header (delta-seconds or an HTTP date), or None."""
+    v = (value or "").strip()
+    if not v:
+        return None
+    if v.replace(".", "", 1).isdigit():
+        return float(v)
+    try:
+        when = _eut.parsedate_to_datetime(v)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=_dt.timezone.utc)
+        return max(0.0, (when - _dt.datetime.now(_dt.timezone.utc)).total_seconds())
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+
+
+def http_request(method, url, params=None, headers=None, json_body=None, data=None,
+                 auth=None, expect="json", ok_statuses=()):
+    """HTTP call with timeouts, budget-aware retries (429/5xx, Retry-After) and
+    errors that are readable in Tableau and never contain a secret.
+    Redirects are followed only to the same origin when the request carries a
+    credential (auth=, a resolved secret anywhere in it, or a credential-named
+    header such as Authorization / Cookie / X-Api-Key). Credentials are never sent
+    over plain http:// (except loopback). 5xx responses are retried for every
+    method: Table Extension connectors are read-only, so a POST is a query.
+    expect: 'json' -> parsed body, 'text' -> str, 'response' -> requests.Response."""
+    import requests
+    if isinstance(auth, (tuple, list)) and len(auth) == 2:
+        _remember_secret("%s:%s" % (auth[0], auth[1]))
+        _remember_secret(auth[1])
+    secret = auth is not None or _carries_secret(url, params, headers, json_body, data) or \
+        any(_CRED_HEADER.search(str(k)) for k in (headers or {}))
+    hops = 0
+    attempt = 0
+    while True:
+        if secret and _urlsplit(str(url)).scheme.lower() != "https" and not _is_loopback(url):
+            raise RuntimeError("tabext: refusing to send a credential over plain HTTP to %s. "
+                               "Use the https:// URL." % _where(url))
+        check_budget("the HTTP call to %s" % _where(url))
+        left = budget_left()
+        conn_to = max(0.5, min(CONNECT_TIMEOUT_S, left - 0.5))
+        read_to = max(0.5, min(READ_TIMEOUT_S, left - conn_to))
+        try:
+            s = _session()
+            verify, cert = _STATE["tls"]
+            r = s.request(method, url, params=params, headers=headers, json=json_body,
+                          data=data, auth=auth, timeout=(conn_to, read_to), allow_redirects=False,
+                          verify=verify, cert=cert, proxies=requests.utils.get_environ_proxies(url))
+        except requests.exceptions.SSLError:
+            raise RuntimeError(
+                "tabext: TLS certificate verification failed for %s. If this host uses a "
+                "corporate/DoD CA, set CA_BUNDLE to a PEM bundle path on the TabPy host."
+                % _where(url)) from None
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            last = "%s (%s)" % (type(e).__name__, _where(url))
+            wait = float(2 ** attempt)
+            if attempt < RETRIES and budget_left() > wait + 2:
+                attempt += 1
+                _time.sleep(wait)
+                continue
+            raise RuntimeError(
+                "tabext: could not reach %s from the TabPy host: %s. Check DNS, proxy, "
+                "firewall and that the API is routable from where TabPy runs." % (_where(url), last)) from None
+        except (requests.exceptions.RequestException, ValueError) as e:
+            raise RuntimeError("tabext: request to %s failed: %s (check the URL)" % (
+                _where(url), type(e).__name__)) from None
+        if r.status_code in (301, 302, 303, 307, 308) and r.status_code not in ok_statuses:
+            loc = r.headers.get("Location", "")
+            nxt = _urljoin(r.url or url, loc) if loc else ""
+            hops += 1
+            if not nxt or hops > 5:
+                raise RuntimeError("tabext: %s redirected too many times or without a Location"
+                                   % _where(url))
+            if secret and not same_origin(url, nxt):
+                raise RuntimeError(
+                    "tabext: %s redirected to another host (%s); refusing to send credentials there. "
+                    "Point the connector at the final URL if that host is trusted."
+                    % (_where(url), _where(nxt)))
+            if r.status_code == 303 or (r.status_code in (301, 302) and method.upper() == "POST"):
+                method, json_body, data = "GET", None, None
+            url, params = nxt, None
+            continue
+        if r.status_code in ok_statuses or r.status_code < 400:
+            if expect == "response":
+                return r
+            if expect == "text":
+                return r.text
+            try:
+                return r.json()
+            except ValueError:
+                raise RuntimeError("tabext: %s returned non-JSON (HTTP %s, %s): %s" % (
+                    _where(url), r.status_code, r.headers.get("Content-Type", "?"),
+                    redact(r.text)[:200])) from None
+        if r.status_code in (429, 500, 502, 503, 504) and attempt < RETRIES:
+            asked = _retry_after(r.headers.get("Retry-After"))
+            wait = float(2 ** attempt) if asked is None else asked
+            if wait + 2 < budget_left():
+                attempt += 1
+                _time.sleep(wait)
+                continue
+            raise RuntimeError("tabext: %s returned HTTP %s; %s %.0fs exceeds the time budget. Reduce "
+                               "request volume or refresh less often." % (
+                                   _where(url), r.status_code,
+                                   "it asked to wait" if asked is not None else "the next retry wait of", wait))
+        hint = {401: "credentials missing or rejected", 403: "credential lacks permission/scope",
+                404: "wrong path or id", 429: "rate limited"}.get(r.status_code, "request failed")
+        raise RuntimeError("tabext: HTTP %s from %s (%s): %s" % (
+            r.status_code, _where(url), hint, redact(r.text)[:300]))
+
+
+def http_get(url, params=None, headers=None, **kw):
+    return http_request("GET", url, params=params, headers=headers, **kw)
+
+
+def http_post(url, json_body=None, headers=None, **kw):
+    return http_request("POST", url, json_body=json_body, headers=headers, **kw)
+
+
+def oauth2_client_credentials(token_url, client_id, client_secret, scope=None, audience=None):
+    """OAuth 2.0 client-credentials grant. Returns an access token (cached for this run)."""
+    key = (token_url, client_id, scope)
+    if key in _STATE["tokens"]:
+        return _STATE["tokens"][key]
+    form = {"grant_type": "client_credentials"}
+    if scope:
+        form["scope"] = scope
+    if audience:
+        form["audience"] = audience
+    body = http_request("POST", token_url, data=form, auth=(client_id, client_secret))
+    tok = body.get("access_token") if isinstance(body, dict) else None
+    if not tok:
+        raise RuntimeError("tabext: token endpoint %s returned no access_token" % _where(token_url))
+    _remember_secret(tok)
+    _STATE["tokens"][key] = tok
+    return tok
+
+
+def paginate(get_page, start, max_pages=10000):
+    """Generic pager. get_page(state) -> (items, next_state); next_state None = done.
+    Covers page numbers, offsets, cursors, next-URLs and date windows."""
+    state, pages = start, 0
+    while state is not None:
+        check_budget("pagination (after %d pages)" % pages)
+        items, state = get_page(state)
+        pages += 1
+        for it in items or []:
+            yield it
+        if state is not None and pages >= max_pages:
+            raise RuntimeError("tabext: stopped after max_pages=%d - raise it or narrow the query" % max_pages)
+
+
+def dig(obj, path, default=None):
+    """dig(rec, 'close_approach_data.0.miss_distance.km') - safe nested lookup."""
+    cur = obj
+    for part in str(path).split("."):
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        elif isinstance(cur, (list, tuple)) and part.lstrip("-").isdigit():
+            i = int(part)
+            cur = cur[i] if -len(cur) <= i < len(cur) else None
+        else:
+            return default
+        if cur is None:
+            return default
+    return cur
+
+
+def items_at(body, path):
+    """The record list at a dotted path. A missing key raises (a renamed field or an
+    error body with HTTP 200 must not become a silent empty table); null = no rows."""
+    cur = body
+    for part in (str(path).split(".") if path else []):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        elif isinstance(cur, (list, tuple)) and part.lstrip("-").isdigit() and -len(cur) <= int(part) < len(cur):
+            cur = cur[int(part)]
+        else:
+            top = sorted(str(k) for k in body)[:12] if isinstance(body, dict) else type(body).__name__
+            raise RuntimeError("tabext: ITEMS_PATH %r not found in the response (top-level keys: %s)"
+                               % (path, redact(str(top))))
+        if cur is None:
+            return []
+    if not isinstance(cur, list):
+        raise RuntimeError("tabext: ITEMS_PATH %r does not point at a list in the response (got %s)"
+                           % (path, type(cur).__name__))
+    return cur
+
+
+def input_records():
+    """Rows of the optional Table Extension input table as a list of dicts.
+    Tableau sends a dict of column lists (JSON) or a DataFrame (Arrow)."""
+    x = _INPUT
+    if x is None or (isinstance(x, (str, bytes)) and not x):
+        return []
+    if hasattr(x, "to_dict"):
+        return x.to_dict(orient="records")
+    if isinstance(x, dict):
+        keys = list(x)
+        n = len(x[keys[0]]) if keys else 0
+        return [dict((k, x[k][i]) for k in keys) for i in range(n)]
+    raise RuntimeError("tabext: unexpected input table type %s" % type(x).__name__)
+
+
+_TRUE = {"true", "t", "yes", "y", "1", "1.0"}
+_FALSE = {"false", "f", "no", "n", "0", "0.0"}
+_EPOCH = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
+_ISO_TZ = _re.compile(r"([+-]\d\d):?(\d\d)$")
+_ISO_FRAC = _re.compile(r"(\d\d:\d\d:\d\d)\.(\d+)")
+_THOUSANDS = _re.compile(r"[+-]?\d{1,3}(?:,\d{3})+(?:\.\d*)?")
+
+
+def _num_text(v):
+    """'1,234.5' -> '1234.5' only when the commas are thousands separators."""
+    return v.replace(",", "") if _THOUSANDS.fullmatch(v) else v
+
+
+def _is_null(v):
+    if v is None:
+        return True
+    if isinstance(v, float):
+        return _math.isnan(v)
+    if isinstance(v, (str, bytes, bool, int)):
+        return False
+    try:
+        r = (v != v)            # NaN / NaT -> True; numpy -> numpy.bool_; pd.NA -> NA
+    except (TypeError, ValueError):
+        return str(v) in ("NaT", "<NA>", "nan")
+    try:
+        return bool(r)
+    except TypeError:
+        return True             # bool(pd.NA) raises TypeError: it is a null
+    except ValueError:
+        return False            # an array: not a scalar null
+
+
+def _parse_dt(v):
+    if isinstance(v, _dt.datetime):
+        d = v
+    elif isinstance(v, _dt.date):
+        d = _dt.datetime(v.year, v.month, v.day)
+    elif isinstance(v, (int, float)) and not isinstance(v, bool) or \
+            isinstance(v, str) and v.strip().lstrip("-").isdigit() and len(v.strip().lstrip("-")) >= 9:
+        f = float(v)
+        a = abs(f)
+        if 19000101 <= a <= 21001231 and isinstance(v, (int, str)) and len(str(int(a))) == 8:
+            d = _dt.datetime.strptime(str(int(a)), "%Y%m%d")            # 20260101
+        else:
+            secs = f / 1e9 if a >= 1e17 else f / 1e6 if a >= 1e14 else f / 1e3 if a >= 1e11 else f  # ns/us/ms/s
+            d = _EPOCH + _dt.timedelta(seconds=secs)
+    else:
+        s = str(v).strip()
+        if s[-1:] in ("Z", "z"):
+            s = s[:-1] + "+00:00"
+        s = s.replace("T", " ", 1) if len(s) > 10 and s[10] in "Tt" else s
+        # Python < 3.11 fromisoformat: needs +HH:MM and a 3- or 6-digit fraction
+        if len(s) > 19:
+            s = _ISO_TZ.sub(r"\1:\2", s) if _re.search(r"\d[+-]\d\d:?\d\d$", s) else s
+            s = _ISO_FRAC.sub(lambda m: m.group(1) + "." + (m.group(2) + "000000")[:6], s, count=1)
+        try:
+            d = _dt.datetime.fromisoformat(s)
+        except ValueError:
+            d = None
+            for fmt in ("%Y-%m-%d %H:%M", "%Y-%b-%d %H:%M", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y", "%Y%m%d"):
+                try:
+                    d = _dt.datetime.strptime(s, fmt)
+                    break
+                except ValueError:
+                    pass
+            if d is None:
+                raise ValueError("unparseable date/time")
+    return d
+
+
+def _coerce(v, typ):
+    if _is_null(v):
+        return None
+    if hasattr(v, "item") and not isinstance(v, (str, bytes)):
+        try:
+            v = v.item()  # numpy scalar -> python
+        except Exception:
+            pass
+    if typ == "string":
+        if isinstance(v, (dict, list, tuple)):
+            return _json.dumps(v, default=str, sort_keys=True)
+        if isinstance(v, bytes):
+            return v.decode("utf-8", "replace")
+        if isinstance(v, (_dt.datetime, _dt.date)):
+            return v.isoformat()
+        return str(v)
+    if isinstance(v, str):
+        v = v.strip()
+        if v == "":
+            return None
+    if typ == "integer":
+        if isinstance(v, bool):
+            return int(v)
+        if isinstance(v, int):
+            i = v
+        elif isinstance(v, _decimal.Decimal) and v.is_finite() and v == v.to_integral_value():
+            i = int(v)                                   # exact, even above 2**53
+        elif isinstance(v, str) and _re.fullmatch(r"[+-]?\d+", _num_text(v)):
+            i = int(_num_text(v))
+        else:
+            f = float(_num_text(v)) if isinstance(v, str) else float(v)
+            if f != int(f):
+                raise ValueError("not a whole number")
+            if abs(f) >= 2 ** 53:
+                raise ValueError("integer too large to be exact as a float; type it string")
+            i = int(f)
+        if not -2 ** 63 <= i < 2 ** 63:
+            raise OverflowError("outside 64-bit integer range; type it string")
+        return i
+    if typ == "real":
+        f = float(_num_text(v)) if isinstance(v, str) else float(v)
+        return None if _math.isnan(f) or _math.isinf(f) else f
+    if typ == "boolean":
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)) and v in (0, 1):
+            return bool(v)
+        s = str(v).strip().lower()
+        if s in _TRUE:
+            return True
+        if s in _FALSE:
+            return False
+        raise ValueError("not a boolean")
+    if typ == "date":
+        return _parse_dt(v).strftime("%Y-%m-%d")        # the value's own calendar date
+    if typ == "datetime":
+        d = _parse_dt(v)
+        if d.tzinfo is not None:
+            d = d.astimezone(_dt.timezone.utc).replace(tzinfo=None)   # Tableau has no tz: UTC
+        return d.strftime("%Y-%m-%d %H:%M:%S")
+    raise RuntimeError("tabext: unknown SCHEMA type %r (use string, integer, real, boolean, date, datetime)" % typ)
+
+
+def to_tableau(rows, schema):
+    """Rows (iterable of dicts, or a DataFrame) -> {column: [values]} with a fixed
+    column order and one JSON/Arrow-safe python type per column. This is the only
+    shape both TabPy transports (JSON and Arrow) and Tableau accept reliably.
+    date/datetime columns are ISO strings: set their type in Tableau (the
+    skill's patch_workbook.py does it for you). String values that contain a
+    secret resolved in this run are redacted. Any exception raised while the rows
+    are produced (fetch, to_row) is re-raised with secrets and query strings
+    removed, so it is safe to show in Tableau and TabPy's log."""
+    if hasattr(rows, "to_dict") and not isinstance(rows, dict):
+        rows = rows.to_dict(orient="records")
+    cols = list(schema)
+    out = dict((c, []) for c in cols)
+    n = 0
+    try:
+        it = iter(rows)
+        while True:
+            try:
+                row = next(it)
+            except StopIteration:
+                break
+            n = _add_row(out, cols, schema, row, n)
+    except Exception as e:
+        msg = str(e)
+        if not msg.startswith("tabext:"):
+            msg = "tabext: %s: %s" % (type(e).__name__, msg)
+        raise RuntimeError(redact(_strip_query(msg))[:1000]) from None
+    for c, k in _STATE["bad"].items():
+        print("tabext: %d value(s) in column %r could not be coerced to %s and were set to null"
+              % (k, c, schema[c]), file=_sys.stderr)
+    return out
+
+
+def _add_row(out, cols, schema, row, n):
+    if n >= MAX_ROWS:
+        raise RuntimeError("tabext: more than MAX_ROWS=%d rows - narrow the query or raise MAX_ROWS" % MAX_ROWS)
+    if n % 5000 == 0:
+        check_budget("building the output table")
+    if not isinstance(row, dict):
+        raise RuntimeError("tabext: to_tableau() expects dict rows, got %s" % type(row).__name__)
+    for c in cols:
+        try:
+            val = _coerce(row.get(c), schema[c])
+        except (TypeError, ValueError, OverflowError, OSError):
+            if ON_BAD_VALUE == "error":
+                raise RuntimeError("tabext: column %r row %d: value can't be read as %s"
+                                   % (c, n, schema[c])) from None
+            _STATE["bad"][c] = _STATE["bad"].get(c, 0) + 1
+            val = None
+        if isinstance(val, str) and _STATE["redact"]:
+            val = redact(val)
+        out[c].append(val)
+    return n + 1
+# ==== END TABEXT RUNTIME v3 ====

@@ -38,10 +38,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install "requests>=2.32.4" "pandas>=1.5" "simplejson>=3.17" "pyarrow>=14.0.1"
 
-      - name: py_compile smoke - every .py in the repo parses
-        run: python -m compileall -q scripts runtime tools tests examples
+      # Connector scripts (examples/) are function bodies with a top-level
+      # `return`, so they're compiled inside TabPy's wrapper by check_script
+      # instead of by compileall.
+      - name: py_compile smoke - every module parses
+        run: python -m compileall -q scripts runtime tools tests
 
-      - name: Runtime + scaffolds stay Python 3.8 syntax
+      - name: Worked example compiles in TabPy's wrapper with Python 3.8 syntax
         run: python -I scripts/check_script.py examples/nasa_neows/nasa_neows.py --py 3.8
 
       - name: Test suite (checker, detector, runtime, workbook patcher, docs freshness)
